@@ -1,0 +1,21 @@
+[package]
+name = "servo-pdf"
+version = "0.1.0"
+authors = ["The Servo Project Developers"]
+edition = "2021"
+license = "MPL-2.0"
+description = "Pure-Rust WebAssembly Component for PDF parsing and DOM HTML rendering"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pure Rust PDF parser
+lopdf = { version = "0.45.0", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+getrandom = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+# For testing

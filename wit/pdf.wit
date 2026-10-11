@@ -1,0 +1,34 @@
+package servo:pdf@0.1.0;
+
+interface console {
+    log: func(message: string);
+    error: func(message: string);
+}
+
+interface viewer {
+    /// Opaque handle to a parsed PDF document
+    resource document {
+        /// Constructor takes bytes and creates a new document
+        constructor(bytes: list<u8>);
+
+        /// Total number of pages
+        page-count: func() -> u32;
+
+        /// Return (width_pt, height_pt) for a given page index
+        page-dimensions: func(page-index: u32) -> result<tuple<f32, f32>, string>;
+
+        /// Compile the page content stream directly into an absolute-positioned HTML fragment
+        render-page-html: func(page-index: u32) -> result<string, string>;
+
+        /// Extract raw plain text for search (Ctrl+F) & indexing
+        extract-page-text: func(page-index: u32) -> result<string, string>;
+    }
+
+    /// Open and index the PDF trailer & xref table (< 5ms)
+    open: func(bytes: list<u8>) -> result<document, string>;
+}
+
+world pdf-engine {
+    export viewer;
+    import console;
+}
