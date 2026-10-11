@@ -105,6 +105,17 @@ impl HtmlPageEmitter {
         }
     }
 
+    /// On `Do` (Image / Logo Paint)
+    pub fn emit_image_placeholder(&mut self, x: f64, y: f64, w: f64, h: f64) {
+        let left = x;
+        let top = (self.page_height - y - h).max(0.0);
+        let style = format!(
+            "position:absolute;left:{left:.1}pt;top:{top:.1}pt;width:{w:.1}pt;height:{h:.1}pt;border:1px dashed #cbd5e1;background:#f8fafc;border-radius:4pt;"
+        );
+        self.html
+            .push_str(&format!(r#"<div class="pdf-node" style="{style}"></div>"#));
+    }
+
     pub fn emit_text(&mut self, x: f64, y: f64, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {

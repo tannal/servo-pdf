@@ -18,7 +18,7 @@ mod wasm;
 
 pub use error::PdfError;
 use lopdf::content::Content;
-use lopdf::Object;
+use lopdf::{Dictionary, Object};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ impl PdfSize {
     }
 }
 
-/// 2D Affine Transform Matrix: [a, b, c, d, e, f]
+/// 2D Affine Transformation Matrix: [a, b, c, d, e, f]
 #[derive(Copy, Clone, Debug)]
 struct Matrix {
     a: f64,
@@ -97,7 +97,16 @@ fn to_f64(obj: &Object) -> f64 {
     to_f64_opt(obj).unwrap_or(0.0)
 }
 
-/// Parses a PDF /ToUnicode CMap stream into a lookup map (Glyph ID -> UTF-8 String)
+/// Helper: Resolve an object whether it's inline or an indirect reference
+fn resolve_dict<'a>(doc: &'a lopdf::Document, obj: &'a Object) -> Option<&'a Dictionary> {
+    match obj {
+        Object::Dictionary(ref d) => Some(d),
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    }
+}
+
+/// Parses /ToUnicode CMap supporting Chinese & Asian composite fonts
 fn parse_to_unicode_cmap(bytes: &[u8]) -> HashMap<u16, String> {
     let mut map = HashMap::new();
     let text = String::from_utf8_lossy(bytes);
@@ -125,22 +134,27 @@ fn parse_to_unicode_cmap(bytes: &[u8]) -> HashMap<u16, String> {
         }
 
         if in_bfchar {
-            // Format: <srcCode> <destCode>
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 let src_hex = parts[0].trim_matches(|c| c == '<' || c == '>');
                 let dst_hex = parts[1].trim_matches(|c| c == '<' || c == '>');
-                if let (Ok(src), Ok(dst)) = (
-                    u16::from_str_radix(src_hex, 16),
-                    u16::from_str_radix(dst_hex, 16),
-                ) {
-                    if let Some(ch) = char::from_u32(dst as u32) {
-                        map.insert(src, ch.to_string());
+                if let Ok(src) = u16::from_str_radix(src_hex, 16) {
+                    let mut decoded = String::new();
+                    for chunk in dst_hex.as_bytes().chunks(4) {
+                        if let Ok(s) = std::str::from_utf8(chunk) {
+                            if let Ok(u) = u16::from_str_radix(s, 16) {
+                                if let Some(ch) = char::from_u32(u as u32) {
+                                    decoded.push(ch);
+                                }
+                            }
+                        }
+                    }
+                    if !decoded.is_empty() {
+                        map.insert(src, decoded);
                     }
                 }
             }
         } else if in_bfrange {
-            // Format: <start> <end> <destStart>
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 3 {
                 let start_hex = parts[0].trim_matches(|c| c == '<' || c == '>');
@@ -213,11 +227,20 @@ impl PdfDocument {
 
     fn get_page_media_box(&self, page_id: lopdf::ObjectId) -> Result<PdfSize, PdfError> {
         let page_dict = self.doc.get_dictionary(page_id).map_err(PdfError::Parse)?;
-        let media_box_obj = page_dict
-            .get(b"MediaBox")
-            .map_err(|_| PdfError::MissingAttribute("MediaBox"))?;
+        let media_box_obj = self
+            .get_inherited_prop(page_dict, b"MediaBox")
+            .ok_or(PdfError::MissingAttribute("MediaBox"))?;
 
-        let array = media_box_obj.as_array().map_err(PdfError::Parse)?;
+        let array = match media_box_obj {
+            Object::Array(ref a) => a,
+            Object::Reference(id) => self
+                .doc
+                .get_object(*id)
+                .and_then(|o| o.as_array())
+                .map_err(PdfError::Parse)?,
+            _ => return Err(PdfError::InvalidFormat("MediaBox must be an array")),
+        };
+
         if array.len() < 4 {
             return Err(PdfError::InvalidFormat(
                 "MediaBox array must have at least 4 numbers",
@@ -232,27 +255,54 @@ impl PdfDocument {
         Ok(PdfSize::new((x2 - x1).abs(), (y2 - y1).abs()))
     }
 
-    /// Load all font ToUnicode CMaps for a given page
+    /// Walk up the /Parent tree to find inherited properties (/Resources, /MediaBox)
+    fn get_inherited_prop<'a>(
+        &'a self,
+        mut dict: &'a Dictionary,
+        key: &[u8],
+    ) -> Option<&'a Object> {
+        loop {
+            if let Ok(obj) = dict.get(key) {
+                return Some(obj);
+            }
+            if let Ok(parent_ref) = dict.get(b"Parent").and_then(|o| o.as_reference()) {
+                if let Ok(parent_dict) = self.doc.get_dictionary(parent_ref) {
+                    dict = parent_dict;
+                    continue;
+                }
+            }
+            break;
+        }
+        None
+    }
+
+    /// Load font CMaps from page or inherited catalog resources
     fn load_page_cmaps(&self, page_id: lopdf::ObjectId) -> HashMap<String, HashMap<u16, String>> {
         let mut cmaps = HashMap::new();
         if let Ok(page_dict) = self.doc.get_dictionary(page_id) {
-            if let Ok(res_dict) = page_dict.get(b"Resources").and_then(|o| o.as_dict()) {
-                if let Ok(font_dict) = res_dict.get(b"Font").and_then(|o| o.as_dict()) {
-                    for (name, obj) in font_dict.iter() {
-                        let name_str = String::from_utf8_lossy(name).to_string();
-                        if let Ok(font_id) = obj.as_reference() {
-                            if let Ok(font_obj_dict) = self.doc.get_dictionary(font_id) {
-                                if let Ok(to_unicode) = font_obj_dict.get(b"ToUnicode") {
-                                    if let Ok(cmap_stream_id) = to_unicode.as_reference() {
-                                        if let Ok(stream) = self
-                                            .doc
-                                            .get_object(cmap_stream_id)
-                                            .and_then(|o| o.as_stream())
-                                        {
+            if let Some(res_obj) = self.get_inherited_prop(page_dict, b"Resources") {
+                if let Some(res_dict) = resolve_dict(&self.doc, res_obj) {
+                    if let Ok(font_obj) = res_dict.get(b"Font") {
+                        if let Some(font_dict) = resolve_dict(&self.doc, font_obj) {
+                            for (name, obj) in font_dict.iter() {
+                                let font_name = String::from_utf8_lossy(name).to_string();
+                                if let Some(single_font_dict) = resolve_dict(&self.doc, obj) {
+                                    // Check ToUnicode stream
+                                    if let Ok(to_unicode) = single_font_dict.get(b"ToUnicode") {
+                                        let stream_opt = match to_unicode {
+                                            Object::Reference(id) => self
+                                                .doc
+                                                .get_object(*id)
+                                                .and_then(|o| o.as_stream())
+                                                .ok(),
+                                            Object::Stream(ref s) => Some(s),
+                                            _ => None,
+                                        };
+                                        if let Some(stream) = stream_opt {
                                             if let Ok(decompressed) = stream.decompressed_content()
                                             {
                                                 cmaps.insert(
-                                                    name_str,
+                                                    font_name,
                                                     parse_to_unicode_cmap(&decompressed),
                                                 );
                                             }
@@ -298,11 +348,9 @@ impl PdfPage {
         cmaps: &HashMap<String, HashMap<u16, String>>,
         emitter: &mut HtmlPageEmitter,
     ) -> Result<(), PdfError> {
-        // Graphics state stack (q / Q)
         let mut matrix_stack: Vec<Matrix> = Vec::new();
         let mut ctm = Matrix::identity();
 
-        // Text state
         let mut text_matrix = Matrix::identity();
         let mut text_line_matrix = Matrix::identity();
         let mut active_font_name = String::new();
@@ -311,17 +359,12 @@ impl PdfPage {
 
         for op in &content.operations {
             match op.operator.as_str() {
-                // Save Graphics State: q
-                "q" => {
-                    matrix_stack.push(ctm);
-                }
-                // Restore Graphics State: Q
+                "q" => matrix_stack.push(ctm),
                 "Q" => {
                     if let Some(prev) = matrix_stack.pop() {
                         ctm = prev;
                     }
                 }
-                // Concat Matrix: a b c d e f cm
                 "cm" => {
                     if let (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) = (
                         op.operands.get(0).and_then(to_f64_opt),
@@ -336,14 +379,12 @@ impl PdfPage {
                     }
                 }
 
-                // Begin / End Text
                 "BT" => {
                     text_matrix = Matrix::identity();
                     text_line_matrix = Matrix::identity();
                 }
                 "ET" => {}
 
-                // Set Font: /Name size Tf
                 "Tf" => {
                     if let (Some(font_name), Some(size)) = (
                         op.operands.get(0).and_then(|o| o.as_name().ok()),
@@ -354,7 +395,6 @@ impl PdfPage {
                     }
                 }
 
-                // Move Text: tx ty Td
                 "Td" => {
                     if let (Some(tx), Some(ty)) = (
                         op.operands.get(0).and_then(to_f64_opt),
@@ -373,7 +413,6 @@ impl PdfPage {
                     }
                 }
 
-                // Set Text Matrix: a b c d e f Tm
                 "Tm" => {
                     if let (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) = (
                         op.operands.get(0).and_then(to_f64_opt),
@@ -388,7 +427,6 @@ impl PdfPage {
                     }
                 }
 
-                // Colors & Line styles
                 "rg" => {
                     if let (Some(r), Some(g), Some(b)) = (
                         op.operands.get(0).and_then(to_f64_opt),
@@ -413,7 +451,6 @@ impl PdfPage {
                     }
                 }
 
-                // Rectangle: x y w h re
                 "re" => {
                     if let (Some(x), Some(y), Some(w), Some(h)) = (
                         op.operands.get(0).and_then(to_f64_opt),
@@ -426,7 +463,6 @@ impl PdfPage {
                     }
                 }
 
-                // Path lines: m, l
                 "m" => {
                     if let (Some(x), Some(y)) = (
                         op.operands.get(0).and_then(to_f64_opt),
@@ -451,6 +487,16 @@ impl PdfPage {
                     line_start = None;
                 }
 
+                // Paint XObject (Logo / Image): /Name Do
+                "Do" => {
+                    let (left, bottom) = ctm.transform_point(0.0, 0.0);
+                    let width = ctm.a.abs();
+                    let height = ctm.d.abs();
+                    if width > 1.0 && height > 1.0 {
+                        emitter.emit_image_placeholder(left, bottom, width, height);
+                    }
+                }
+
                 // Show Text: (str) Tj
                 "Tj" => {
                     if let Some(str_obj) = op.operands.first() {
@@ -462,7 +508,7 @@ impl PdfPage {
                     }
                 }
 
-                // Show Text Array: [ (str) offset (str) ] TJ
+                // Show Text Array: [ ... ] TJ
                 "TJ" => {
                     if let Some(array) = op.operands.first().and_then(|o| o.as_array().ok()) {
                         let mut full_text = String::new();
@@ -490,35 +536,34 @@ impl PdfPage {
     }
 }
 
-/// Decodes bytes via active font's ToUnicode CMap; falls back to UTF-8 / Latin1
+/// Decodes bytes via ToUnicode CMap; handles CJK, UTF-16BE, and Latin-1 fallbacks cleanly
 fn decode_text_with_cmap(
     bytes: &[u8],
     font_name: &str,
     cmaps: &HashMap<String, HashMap<u16, String>>,
 ) -> String {
+    // 1. Check font's ToUnicode CMap
     if let Some(cmap) = cmaps.get(font_name) {
         let mut out = String::new();
-        // 2-byte font glyph codes
-        if bytes.len() >= 2 && bytes.len() % 2 == 0 {
+        if bytes.len() >= 2 {
             for chunk in bytes.chunks_exact(2) {
                 let code = u16::from_be_bytes([chunk[0], chunk[1]]);
                 if let Some(s) = cmap.get(&code) {
                     out.push_str(s);
                 } else if let Some(ch) = char::from_u32(code as u32) {
-                    out.push(ch);
+                    if !ch.is_control() {
+                        out.push(ch);
+                    }
                 }
             }
             if !out.is_empty() {
                 return out;
             }
         }
-        // 1-byte font glyph codes
         for &b in bytes {
             let code = b as u16;
             if let Some(s) = cmap.get(&code) {
                 out.push_str(s);
-            } else {
-                out.push(b as char);
             }
         }
         if !out.is_empty() {
@@ -526,6 +571,29 @@ fn decode_text_with_cmap(
         }
     }
 
-    // Fallback: standard UTF-8 or Latin-1
-    String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect())
+    // 2. UTF-16BE with BOM
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let u16s: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&u16s);
+    }
+
+    // 3. UTF-8
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+
+    // 4. ASCII & Latin-1 clean fallback (filter out unprintable control codes)
+    bytes
+        .iter()
+        .filter_map(|&b| {
+            if b >= 0x20 && b <= 0x7E {
+                Some(b as char)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
