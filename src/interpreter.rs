@@ -1,10 +1,15 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 use lopdf::content::Content;
 use lopdf::Object;
 use std::collections::HashMap;
 
-use crate::cmap::decode_text;
+use crate::document::PdfPage;
+use crate::encoding::decode_pdf_text;
+use crate::error::PdfError;
 use crate::html_emitter::HtmlPageEmitter;
-use crate::image::extract_xobject_image;
 use crate::matrix::Matrix;
 
 fn to_f64_opt(obj: &Object) -> Option<f64> {
@@ -15,13 +20,13 @@ fn to_f64_opt(obj: &Object) -> Option<f64> {
     }
 }
 
-pub fn interpret_page_content(
-    doc: &lopdf::Document,
-    page_dict: &lopdf::Dictionary,
+pub fn interpret_page(
+    page: &PdfPage,
     content: &Content,
     cmaps: &HashMap<String, HashMap<u16, String>>,
+    differences: &HashMap<String, HashMap<u8, char>>,
     emitter: &mut HtmlPageEmitter,
-) {
+) -> Result<(), PdfError> {
     let mut matrix_stack: Vec<Matrix> = Vec::new();
     let mut ctm = Matrix::identity();
 
@@ -132,11 +137,13 @@ pub fn interpret_page_content(
                     op.operands.get(2).and_then(to_f64_opt),
                     op.operands.get(3).and_then(to_f64_opt),
                 ) {
-                    let (abs_x, abs_y) = ctm.transform_point(x, y);
-                    emitter.emit_rect(abs_x, abs_y, w, h, true, false);
+                    // Skip full-page background clipping rectangles
+                    if !(w >= page.width_pts - 2.0 && h >= page.height_pts - 2.0) {
+                        let (abs_x, abs_y) = ctm.transform_point(x, y);
+                        emitter.emit_rect(abs_x, abs_y, w, h, true, false);
+                    }
                 }
             }
-
             "m" => {
                 if let (Some(x), Some(y)) = (
                     op.operands.get(0).and_then(to_f64_opt),
@@ -167,10 +174,8 @@ pub fn interpret_page_content(
                     let width = ctm.a.abs();
                     let height = ctm.d.abs();
                     if width > 1.0 && height > 1.0 {
-                        if let Some(data_uri) = extract_xobject_image(doc, page_dict, name_bytes) {
+                        if let Some(data_uri) = page.extract_xobject_image(name_bytes) {
                             emitter.emit_image(left, bottom, width, height, &data_uri);
-                        } else {
-                            emitter.emit_image_placeholder(left, bottom, width, height);
                         }
                     }
                 }
@@ -179,7 +184,7 @@ pub fn interpret_page_content(
             "Tj" => {
                 if let Some(str_obj) = op.operands.first() {
                     if let Ok(bytes) = str_obj.as_str() {
-                        let text = decode_text(bytes, &active_font_name, cmaps);
+                        let text = decode_pdf_text(bytes, &active_font_name, cmaps, differences);
                         let combined = text_matrix.multiply(&ctm);
                         emitter.emit_text(combined.e, combined.f, &text);
                     }
@@ -190,8 +195,27 @@ pub fn interpret_page_content(
                 if let Some(array) = op.operands.first().and_then(|o| o.as_array().ok()) {
                     let mut full_text = String::new();
                     for item in array {
-                        if let Ok(bytes) = item.as_str() {
-                            full_text.push_str(&decode_text(bytes, &active_font_name, cmaps));
+                        match item {
+                            Object::String(bytes, _) => {
+                                full_text.push_str(&decode_pdf_text(
+                                    bytes,
+                                    &active_font_name,
+                                    cmaps,
+                                    differences,
+                                ));
+                            }
+                            Object::Integer(n) => {
+                                // Large displacement in TJ indicates a space or column gap
+                                if *n < -180 {
+                                    full_text.push(' ');
+                                }
+                            }
+                            Object::Real(f) => {
+                                if *f < -180.0 {
+                                    full_text.push(' ');
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !full_text.is_empty() {
@@ -204,4 +228,6 @@ pub fn interpret_page_content(
             _ => {}
         }
     }
+
+    Ok(())
 }

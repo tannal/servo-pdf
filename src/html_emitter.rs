@@ -3,15 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 pub struct HtmlPageEmitter {
-    page_width: f64,
-    page_height: f64,
+    pub page_width: f64,
+    pub page_height: f64,
     html: String,
     current_fill_color: String,
     current_stroke_color: String,
     current_line_width: f64,
     current_font_size: f64,
     current_font_name: String,
-    plain_text: String,
 }
 
 impl HtmlPageEmitter {
@@ -25,7 +24,6 @@ impl HtmlPageEmitter {
             current_line_width: 1.0,
             current_font_size: 10.0,
             current_font_name: "sans-serif".into(),
-            plain_text: String::new(),
         }
     }
 
@@ -105,7 +103,6 @@ impl HtmlPageEmitter {
         }
     }
 
-    /// Real image rendering with Base64 data URI
     pub fn emit_image(&mut self, x: f64, y: f64, w: f64, h: f64, data_uri: &str) {
         let left = x;
         let top = (self.page_height - y - h).max(0.0);
@@ -117,24 +114,11 @@ impl HtmlPageEmitter {
         ));
     }
 
-    pub fn emit_image_placeholder(&mut self, x: f64, y: f64, w: f64, h: f64) {
-        let left = x;
-        let top = (self.page_height - y - h).max(0.0);
-        let style = format!(
-            "position:absolute;left:{left:.1}pt;top:{top:.1}pt;width:{w:.1}pt;height:{h:.1}pt;border:1px dashed #cbd5e1;background:#f8fafc;border-radius:4pt;"
-        );
-        self.html
-            .push_str(&format!(r#"<div class="pdf-node" style="{style}"></div>"#));
-    }
-
     pub fn emit_text(&mut self, x: f64, y: f64, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
         }
-
-        self.plain_text.push_str(trimmed);
-        self.plain_text.push(' ');
 
         let left = x;
         let top = (self.page_height - y - (self.current_font_size * 0.85)).max(0.0);
@@ -142,21 +126,19 @@ impl HtmlPageEmitter {
         let is_bold = self.current_font_name.to_lowercase().contains("bold");
         let weight_css = if is_bold { "font-weight:700;" } else { "" };
 
-        let escaped = html_escape(text);
+        let escaped = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+
         self.html.push_str(&format!(
-            r#"<span class="pdf-node" style="left:{left:.1}pt;top:{top:.1}pt;font-size:{:.1}pt;color:{};{};">{escaped}</span>"#,
+            r#"<span class="pdf-node" style="position:absolute;left:{left:.1}pt;top:{top:.1}pt;font-size:{:.1}pt;color:{};white-space:pre;transform-origin:0 0;{};">{escaped}</span>"#,
             self.current_font_size, self.current_fill_color, weight_css
         ));
     }
 
     pub fn finish(self) -> (String, String) {
-        (self.html, self.plain_text)
+        (self.html, String::new())
     }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
