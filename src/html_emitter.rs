@@ -19,7 +19,7 @@ impl HtmlPageEmitter {
         Self {
             page_width,
             page_height,
-            html: String::with_capacity(4096),
+            html: String::with_capacity(8192),
             current_fill_color: "#0f172a".into(),
             current_stroke_color: "#1e293b".into(),
             current_line_width: 1.0,
@@ -105,7 +105,18 @@ impl HtmlPageEmitter {
         }
     }
 
-    /// On `Do` (Image / Logo Paint)
+    /// Real image rendering with Base64 data URI
+    pub fn emit_image(&mut self, x: f64, y: f64, w: f64, h: f64, data_uri: &str) {
+        let left = x;
+        let top = (self.page_height - y - h).max(0.0);
+        let style = format!(
+            "position:absolute;left:{left:.1}pt;top:{top:.1}pt;width:{w:.1}pt;height:{h:.1}pt;object-fit:contain;"
+        );
+        self.html.push_str(&format!(
+            r#"<img class="pdf-node" src="{data_uri}" style="{style}" alt="PDF Image" />"#
+        ));
+    }
+
     pub fn emit_image_placeholder(&mut self, x: f64, y: f64, w: f64, h: f64) {
         let left = x;
         let top = (self.page_height - y - h).max(0.0);
@@ -126,7 +137,6 @@ impl HtmlPageEmitter {
         self.plain_text.push(' ');
 
         let left = x;
-        // In PDF (x, y) is the font baseline. Subtracting font_size * 0.85 aligns with CSS top
         let top = (self.page_height - y - (self.current_font_size * 0.85)).max(0.0);
 
         let is_bold = self.current_font_name.to_lowercase().contains("bold");

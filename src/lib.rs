@@ -37,7 +37,7 @@ impl PdfSize {
     }
 }
 
-/// 2D Affine Transformation Matrix: [a, b, c, d, e, f]
+/// 2D Affine Transform Matrix: [a, b, c, d, e, f]
 #[derive(Copy, Clone, Debug)]
 struct Matrix {
     a: f64,
@@ -97,7 +97,6 @@ fn to_f64(obj: &Object) -> f64 {
     to_f64_opt(obj).unwrap_or(0.0)
 }
 
-/// Helper: Resolve an object whether it's inline or an indirect reference
 fn resolve_dict<'a>(doc: &'a lopdf::Document, obj: &'a Object) -> Option<&'a Dictionary> {
     match obj {
         Object::Dictionary(ref d) => Some(d),
@@ -106,7 +105,32 @@ fn resolve_dict<'a>(doc: &'a lopdf::Document, obj: &'a Object) -> Option<&'a Dic
     }
 }
 
-/// Parses /ToUnicode CMap supporting Chinese & Asian composite fonts
+/// Pure Rust Base64 Encoder for Data URI Images (no external crate required)
+fn to_base64(data: &[u8]) -> String {
+    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        out.push(CHARSET[(b0 >> 2) as usize] as char);
+        out.push(CHARSET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARSET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARSET[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Parses /ToUnicode CMap for Chinese, Japanese, and Western font subsets
 fn parse_to_unicode_cmap(bytes: &[u8]) -> HashMap<u16, String> {
     let mut map = HashMap::new();
     let text = String::from_utf8_lossy(bytes);
@@ -225,6 +249,26 @@ impl PdfDocument {
         })
     }
 
+    fn get_inherited_prop<'a>(
+        &'a self,
+        mut dict: &'a Dictionary,
+        key: &[u8],
+    ) -> Option<&'a Object> {
+        loop {
+            if let Ok(obj) = dict.get(key) {
+                return Some(obj);
+            }
+            if let Ok(parent_ref) = dict.get(b"Parent").and_then(|o| o.as_reference()) {
+                if let Ok(parent_dict) = self.doc.get_dictionary(parent_ref) {
+                    dict = parent_dict;
+                    continue;
+                }
+            }
+            break;
+        }
+        None
+    }
+
     fn get_page_media_box(&self, page_id: lopdf::ObjectId) -> Result<PdfSize, PdfError> {
         let page_dict = self.doc.get_dictionary(page_id).map_err(PdfError::Parse)?;
         let media_box_obj = self
@@ -255,28 +299,7 @@ impl PdfDocument {
         Ok(PdfSize::new((x2 - x1).abs(), (y2 - y1).abs()))
     }
 
-    /// Walk up the /Parent tree to find inherited properties (/Resources, /MediaBox)
-    fn get_inherited_prop<'a>(
-        &'a self,
-        mut dict: &'a Dictionary,
-        key: &[u8],
-    ) -> Option<&'a Object> {
-        loop {
-            if let Ok(obj) = dict.get(key) {
-                return Some(obj);
-            }
-            if let Ok(parent_ref) = dict.get(b"Parent").and_then(|o| o.as_reference()) {
-                if let Ok(parent_dict) = self.doc.get_dictionary(parent_ref) {
-                    dict = parent_dict;
-                    continue;
-                }
-            }
-            break;
-        }
-        None
-    }
-
-    /// Load font CMaps from page or inherited catalog resources
+    /// Load font CMaps from page or inherited catalog resources, checking both /Font and /DescendantFonts
     fn load_page_cmaps(&self, page_id: lopdf::ObjectId) -> HashMap<String, HashMap<u16, String>> {
         let mut cmaps = HashMap::new();
         if let Ok(page_dict) = self.doc.get_dictionary(page_id) {
@@ -286,25 +309,25 @@ impl PdfDocument {
                         if let Some(font_dict) = resolve_dict(&self.doc, font_obj) {
                             for (name, obj) in font_dict.iter() {
                                 let font_name = String::from_utf8_lossy(name).to_string();
-                                if let Some(single_font_dict) = resolve_dict(&self.doc, obj) {
-                                    // Check ToUnicode stream
-                                    if let Ok(to_unicode) = single_font_dict.get(b"ToUnicode") {
-                                        let stream_opt = match to_unicode {
-                                            Object::Reference(id) => self
-                                                .doc
-                                                .get_object(*id)
-                                                .and_then(|o| o.as_stream())
-                                                .ok(),
-                                            Object::Stream(ref s) => Some(s),
-                                            _ => None,
-                                        };
-                                        if let Some(stream) = stream_opt {
-                                            if let Ok(decompressed) = stream.decompressed_content()
-                                            {
-                                                cmaps.insert(
-                                                    font_name,
-                                                    parse_to_unicode_cmap(&decompressed),
-                                                );
+                                if let Some(single_font) = resolve_dict(&self.doc, obj) {
+                                    // 1. Direct /ToUnicode
+                                    if let Some(map) = self.extract_to_unicode_stream(single_font) {
+                                        cmaps.insert(font_name.clone(), map);
+                                        continue;
+                                    }
+                                    // 2. Look in /DescendantFonts (Type 0 / CIDFont)
+                                    if let Ok(df_array) = single_font
+                                        .get(b"DescendantFonts")
+                                        .and_then(|o| o.as_array())
+                                    {
+                                        for df_ref in df_array {
+                                            if let Some(df_dict) = resolve_dict(&self.doc, df_ref) {
+                                                if let Some(map) =
+                                                    self.extract_to_unicode_stream(df_dict)
+                                                {
+                                                    cmaps.insert(font_name.clone(), map);
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -316,6 +339,22 @@ impl PdfDocument {
             }
         }
         cmaps
+    }
+
+    fn extract_to_unicode_stream(&self, dict: &Dictionary) -> Option<HashMap<u16, String>> {
+        if let Ok(to_unicode) = dict.get(b"ToUnicode") {
+            let stream_opt = match to_unicode {
+                Object::Reference(id) => self.doc.get_object(*id).and_then(|o| o.as_stream()).ok(),
+                Object::Stream(ref s) => Some(s),
+                _ => None,
+            };
+            if let Some(stream) = stream_opt {
+                if let Ok(decompressed) = stream.decompressed_content() {
+                    return Some(parse_to_unicode_cmap(&decompressed));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -487,17 +526,23 @@ impl PdfPage {
                     line_start = None;
                 }
 
-                // Paint XObject (Logo / Image): /Name Do
+                // Paint XObject Image / Logo
                 "Do" => {
-                    let (left, bottom) = ctm.transform_point(0.0, 0.0);
-                    let width = ctm.a.abs();
-                    let height = ctm.d.abs();
-                    if width > 1.0 && height > 1.0 {
-                        emitter.emit_image_placeholder(left, bottom, width, height);
+                    if let Some(name_bytes) = op.operands.first().and_then(|o| o.as_name().ok()) {
+                        let (left, bottom) = ctm.transform_point(0.0, 0.0);
+                        let width = ctm.a.abs();
+                        let height = ctm.d.abs();
+                        if width > 1.0 && height > 1.0 {
+                            if let Some(data_uri) = self.extract_xobject_image(name_bytes) {
+                                emitter.emit_image(left, bottom, width, height, &data_uri);
+                            } else {
+                                emitter.emit_image_placeholder(left, bottom, width, height);
+                            }
+                        }
                     }
                 }
 
-                // Show Text: (str) Tj
+                // Show Text
                 "Tj" => {
                     if let Some(str_obj) = op.operands.first() {
                         if let Ok(bytes) = str_obj.as_str() {
@@ -508,7 +553,7 @@ impl PdfPage {
                     }
                 }
 
-                // Show Text Array: [ ... ] TJ
+                // Show Text Array
                 "TJ" => {
                     if let Some(array) = op.operands.first().and_then(|o| o.as_array().ok()) {
                         let mut full_text = String::new();
@@ -534,15 +579,56 @@ impl PdfPage {
 
         Ok(())
     }
+
+    /// Extract an image XObject stream and convert to a data:image/... URI
+    fn extract_xobject_image(&self, name_bytes: &[u8]) -> Option<String> {
+        let page_dict = self.document.doc.get_dictionary(self.page_id).ok()?;
+        let res_obj = self.document.get_inherited_prop(page_dict, b"Resources")?;
+        let res_dict = resolve_dict(&self.document.doc, res_obj)?;
+        let xobj_ref = res_dict.get(b"XObject").ok()?;
+        let xobj_dict = resolve_dict(&self.document.doc, xobj_ref)?;
+
+        let img_obj = xobj_dict.get(name_bytes).ok()?;
+        let stream = match img_obj {
+            Object::Reference(id) => self
+                .document
+                .doc
+                .get_object(*id)
+                .and_then(|o| o.as_stream())
+                .ok()?,
+            Object::Stream(ref s) => s,
+            _ => return None,
+        };
+
+        // Check if JPEG (/DCTDecode)
+        let is_jpeg = if let Ok(filter) = stream.dict.get(b"Filter") {
+            match filter {
+                Object::Name(ref n) => n == b"DCTDecode",
+                Object::Array(ref a) => a
+                    .iter()
+                    .any(|o| o.as_name().map(|n| n == b"DCTDecode").unwrap_or(false)),
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        if is_jpeg {
+            let b64 = to_base64(&stream.content);
+            return Some(format!("data:image/jpeg;base64,{b64}"));
+        }
+
+        None
+    }
 }
 
-/// Decodes bytes via ToUnicode CMap; handles CJK, UTF-16BE, and Latin-1 fallbacks cleanly
+/// Decodes bytes via ToUnicode CMap, with automatic 2-byte UTF-16BE (Chinese/CJK) detection
 fn decode_text_with_cmap(
     bytes: &[u8],
     font_name: &str,
     cmaps: &HashMap<String, HashMap<u16, String>>,
 ) -> String {
-    // 1. Check font's ToUnicode CMap
+    // 1. CMap Lookup
     if let Some(cmap) = cmaps.get(font_name) {
         let mut out = String::new();
         if bytes.len() >= 2 {
@@ -571,7 +657,7 @@ fn decode_text_with_cmap(
         }
     }
 
-    // 2. UTF-16BE with BOM
+    // 2. Explicit UTF-16BE with BOM
     if bytes.starts_with(&[0xFE, 0xFF]) {
         let u16s: Vec<u16> = bytes[2..]
             .chunks_exact(2)
@@ -580,12 +666,32 @@ fn decode_text_with_cmap(
         return String::from_utf16_lossy(&u16s);
     }
 
-    // 3. UTF-8
+    // 3. Auto-detect 2-byte UTF-16BE without BOM (WPS / Word / Chinese government forms)
+    // If even length and contains CJK ideograph ranges (0x4E00..=0x9FFF) or ASCII zero-high byte (0x00, 0x20..0x7E)
+    if bytes.len() >= 2 && bytes.len() % 2 == 0 {
+        let is_likely_utf16 = bytes.chunks_exact(2).any(|c| {
+            let u = u16::from_be_bytes([c[0], c[1]]);
+            (0x4E00..=0x9FFF).contains(&u) || (c[0] == 0x00 && c[1] >= 0x20 && c[1] <= 0x7E)
+        });
+
+        if is_likely_utf16 {
+            let u16s: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            let decoded = String::from_utf16_lossy(&u16s);
+            if !decoded.trim().is_empty() {
+                return decoded;
+            }
+        }
+    }
+
+    // 4. Standard UTF-8 fallback
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }
 
-    // 4. ASCII & Latin-1 clean fallback (filter out unprintable control codes)
+    // 5. Clean ASCII string
     bytes
         .iter()
         .filter_map(|&b| {
